@@ -1,0 +1,27 @@
+# Apple/Xcode
+DerivedData/
+DerivedData*/
+build/
+*.xcuserstate
+xcuserdata/
+*.mobileprovision
+
+# Private relay configuration
+RelayConfig.plist
+.private-endpoint
+.dev.vars
+.env
+.env.*
+!.env.example
+
+# Cloudflare/Node
+node_modules/
+.wrangler/
+
+# macOS
+.DS_Store
+
+# Personal health exports and captures
+health-data/
+health-export*
+screenshots-private/
