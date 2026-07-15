@@ -84,20 +84,20 @@ final class HealthManager: ObservableObject {
 
         for metric in quantityMetrics {
             guard let type = HKQuantityType.quantityType(forIdentifier: metric.identifier) else { continue }
-            readLatestQuantity(metric, type: type)
+            readRecentQuantities(metric, type: type)
         }
 
         if let sleepType = HKCategoryType.categoryType(forIdentifier: .sleepAnalysis) {
-            readLatestSleep(sleepType)
+            readSleepWeek(sleepType)
         }
     }
 
-    private func readLatestQuantity(_ metric: QuantityMetric, type: HKQuantityType) {
+    private func readRecentQuantities(_ metric: QuantityMetric, type: HKQuantityType) {
         let sort = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
         let query = HKSampleQuery(
             sampleType: type,
             predicate: nil,
-            limit: 1,
+            limit: 3,
             sortDescriptors: [sort]
         ) { [weak self] _, samples, error in
             DispatchQueue.main.async {
@@ -106,7 +106,8 @@ final class HealthManager: ObservableObject {
                     return
                 }
 
-                guard let sample = samples?.first as? HKQuantitySample else {
+                let quantitySamples = (samples as? [HKQuantitySample]) ?? []
+                guard let sample = quantitySamples.first else {
                     self?.upsertRow(title: metric.title, value: "暂无记录", time: "健康 App 里还没有这项数据")
                     return
                 }
@@ -115,21 +116,23 @@ final class HealthManager: ObservableObject {
                 let time = sample.endDate.formatted(date: .abbreviated, time: .shortened)
                 let displayValue = metric.format(value)
                 self?.upsertRow(title: metric.title, value: displayValue, time: time)
-                self?.uploadQuantity(metric, value: value, displayValue: displayValue, sample: sample)
+                self?.uploadQuantityHistory(metric, samples: quantitySamples)
                 self?.refreshShareText()
-                self?.statusText = "读取完成"
+                self?.statusText = "读取完成（睡眠近 7 天，其余最近 3 次）"
             }
         }
 
         healthStore.execute(query)
     }
 
-    private func readLatestSleep(_ type: HKCategoryType) {
+    private func readSleepWeek(_ type: HKCategoryType) {
+        let startDate = Calendar.current.date(byAdding: .day, value: -7, to: Date()) ?? Date().addingTimeInterval(-7 * 24 * 60 * 60)
+        let predicate = HKQuery.predicateForSamples(withStart: startDate, end: Date(), options: [])
         let sort = NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)
         let query = HKSampleQuery(
             sampleType: type,
-            predicate: nil,
-            limit: 1,
+            predicate: predicate,
+            limit: HKObjectQueryNoLimit,
             sortDescriptors: [sort]
         ) { [weak self] _, samples, error in
             DispatchQueue.main.async {
@@ -138,25 +141,19 @@ final class HealthManager: ObservableObject {
                     return
                 }
 
-                guard let sample = samples?.first as? HKCategorySample else {
-                    self?.upsertRow(title: "睡眠", value: "暂无记录", time: "健康 App 里还没有睡眠数据")
+                let sleepSamples = (samples as? [HKCategorySample]) ?? []
+                guard !sleepSamples.isEmpty else {
+                    self?.upsertRow(title: "睡眠", value: "暂无记录", time: "最近 7 天没有睡眠数据")
                     return
                 }
 
-                let minutes = Int(sample.endDate.timeIntervalSince(sample.startDate) / 60)
-                let time = "\(sample.startDate.formatted(date: .abbreviated, time: .shortened)) - \(sample.endDate.formatted(date: .omitted, time: .shortened))"
-                self?.upsertRow(title: "睡眠", value: "\(minutes) 分钟", time: time)
-                self?.uploadMetric(
-                    key: "sleep",
-                    value: minutes,
-                    unit: "min",
-                    displayValue: "\(minutes) 分钟",
-                    sampledAt: sample.endDate,
-                    source: sample.sourceRevision.source.name,
-                    extra: ["started_at": ISO8601DateFormatter().string(from: sample.startDate)]
-                )
+                let asleepMinutes = self?.totalAsleepMinutes(in: sleepSamples) ?? 0
+                let value = String(format: "近 7 天 %.1f 小时", Double(asleepMinutes) / 60)
+                let time = "\(sleepSamples.count) 条阶段记录（核心、深睡、REM、清醒等）"
+                self?.upsertRow(title: "睡眠", value: value, time: time)
+                self?.uploadSleepHistory(sleepSamples)
                 self?.refreshShareText()
-                self?.statusText = "读取完成"
+                self?.statusText = "读取完成（睡眠近 7 天，其余最近 3 次）"
             }
         }
 
@@ -197,56 +194,56 @@ final class HealthManager: ObservableObject {
     private func syncLatestSample(for type: HKSampleType, completion: @escaping () -> Void) {
         if let quantityType = type as? HKQuantityType,
            let metric = quantityMetrics.first(where: { $0.identifier.rawValue == quantityType.identifier }) {
-            readLatestQuantity(metric, type: quantityType)
+            readRecentQuantities(metric, type: quantityType)
         } else if let sleepType = type as? HKCategoryType,
                   sleepType.identifier == HKCategoryTypeIdentifier.sleepAnalysis.rawValue {
-            readLatestSleep(sleepType)
+            readSleepWeek(sleepType)
         }
         completion()
     }
 
-    private func uploadQuantity(
-        _ metric: QuantityMetric,
-        value: Double,
-        displayValue: String,
-        sample: HKQuantitySample
-    ) {
-        let relayValue = normalizedRelayValue(value, identifier: metric.identifier)
-        uploadMetric(
-            key: relayKey(for: metric.identifier),
-            value: relayValue,
-            unit: relayUnit(for: metric.identifier),
-            displayValue: displayValue,
-            sampledAt: sample.endDate,
-            source: sample.sourceRevision.source.name
-        )
+    private func uploadQuantityHistory(_ metric: QuantityMetric, samples: [HKQuantitySample]) {
+        let records: [[String: Any]] = samples.map { sample in
+            let value = sample.quantity.doubleValue(for: metric.unit)
+            return [
+                "value": normalizedRelayValue(value, identifier: metric.identifier),
+                "unit": relayUnit(for: metric.identifier),
+                "display_value": metric.format(value),
+                "sampled_at": ISO8601DateFormatter().string(from: sample.endDate),
+                "source_device": sample.sourceRevision.source.name,
+            ]
+        }
+        uploadHistory(key: relayKey(for: metric.identifier), records: records)
     }
 
-    private func uploadMetric(
-        key: String,
-        value: Any,
-        unit: String,
-        displayValue: String,
-        sampledAt: Date,
-        source: String,
-        extra: [String: Any] = [:]
-    ) {
-        guard let config = RelayConfiguration.load(),
+    private func uploadSleepHistory(_ samples: [HKCategorySample]) {
+        let records: [[String: Any]] = samples.map { sample in
+            let stage = sleepStage(for: sample.value)
+            let minutes = Int(sample.endDate.timeIntervalSince(sample.startDate) / 60)
+            return [
+                "value": minutes,
+                "unit": "min",
+                "display_value": "\(stage.title) \(minutes) 分钟",
+                "stage": stage.key,
+                "stage_name": stage.title,
+                "started_at": ISO8601DateFormatter().string(from: sample.startDate),
+                "sampled_at": ISO8601DateFormatter().string(from: sample.endDate),
+                "source_device": sample.sourceRevision.source.name,
+            ]
+        }
+        uploadHistory(key: "sleep", records: records)
+    }
+
+    private func uploadHistory(key: String, records: [[String: Any]]) {
+        guard !records.isEmpty,
+              let newestDate = records.compactMap({ $0["sampled_at"] as? String }).max(),
+              let config = RelayConfiguration.load(),
               let url = URL(string: config.baseURL + "/upload") else { return }
-        let sampledAtText = ISO8601DateFormatter().string(from: sampledAt)
-        var metric: [String: Any] = [
-            "value": value,
-            "unit": unit,
-            "display_value": displayValue,
-            "sampled_at": sampledAtText,
-            "source_device": source,
-        ]
-        metric.merge(extra) { _, new in new }
 
         let payload: [String: Any] = [
-            "sampled_at": sampledAtText,
+            "sampled_at": newestDate,
             "device": "iPhone HealthKit",
-            "metrics": [key: metric],
+            "history": [key: records],
         ]
         guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return }
 
@@ -256,6 +253,44 @@ final class HealthManager: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(config.uploadToken)", forHTTPHeaderField: "Authorization")
         URLSession.shared.dataTask(with: request).resume()
+    }
+
+    private func sleepStage(for value: Int) -> (key: String, title: String) {
+        switch value {
+        case HKCategoryValueSleepAnalysis.inBed.rawValue: ("in_bed", "在床")
+        case HKCategoryValueSleepAnalysis.awake.rawValue: ("awake", "清醒")
+        case HKCategoryValueSleepAnalysis.asleepCore.rawValue: ("asleep_core", "核心睡眠")
+        case HKCategoryValueSleepAnalysis.asleepDeep.rawValue: ("asleep_deep", "深睡")
+        case HKCategoryValueSleepAnalysis.asleepREM.rawValue: ("asleep_rem", "REM")
+        case HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue: ("asleep_unspecified", "睡眠")
+        default: ("unknown", "未知阶段")
+        }
+    }
+
+    private func totalAsleepMinutes(in samples: [HKCategorySample]) -> Int {
+        let asleepValues: Set<Int> = [
+            HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue,
+            HKCategoryValueSleepAnalysis.asleepCore.rawValue,
+            HKCategoryValueSleepAnalysis.asleepDeep.rawValue,
+            HKCategoryValueSleepAnalysis.asleepREM.rawValue,
+        ]
+        let intervals = samples
+            .filter { asleepValues.contains($0.value) }
+            .map { ($0.startDate, $0.endDate) }
+            .sorted { $0.0 < $1.0 }
+
+        guard var current = intervals.first else { return 0 }
+        var seconds: TimeInterval = 0
+        for interval in intervals.dropFirst() {
+            if interval.0 <= current.1 {
+                current.1 = max(current.1, interval.1)
+            } else {
+                seconds += current.1.timeIntervalSince(current.0)
+                current = interval
+            }
+        }
+        seconds += current.1.timeIntervalSince(current.0)
+        return Int(seconds / 60)
     }
 
     private func normalizedRelayValue(_ value: Double, identifier: HKQuantityTypeIdentifier) -> Double {
@@ -374,7 +409,7 @@ struct ContentView: View {
                     .padding(.vertical, 8)
                 }
 
-                Section("最近一次记录") {
+                Section("健康数据概览") {
                     ForEach(healthManager.rows) { row in
                         VStack(alignment: .leading, spacing: 4) {
                             Text(row.title)

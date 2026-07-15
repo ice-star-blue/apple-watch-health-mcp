@@ -1,6 +1,6 @@
 # Apple Watch Health MCP
 
-把用户明确授权的 Apple Health / Apple Watch 数据，通过自托管 Cloudflare Worker 暴露为远程 MCP 工具，让 ChatGPT、Codex 或其他 MCP 客户端读取最新健康快照。
+把用户明确授权的 Apple Health / Apple Watch 数据，通过自托管 Cloudflare Worker 暴露为远程 MCP 工具，让 ChatGPT、Codex 或其他 MCP 客户端读取最新数据和受限历史。
 
 > This project connects user-authorized Apple Health data to an AI assistant through a self-hosted MCP relay.
 
@@ -8,9 +8,10 @@
 
 ## 能做什么
 
-- iPhone 从 HealthKit 读取最近一次心率、静息心率、HRV、血氧、呼吸频率、步数、距离、活动能量、噪音暴露、睡眠等数据。
+- iPhone 从 HealthKit 读取心率、静息心率、HRV、血氧、呼吸频率、步数、距离、活动能量、噪音暴露、睡眠等数据。
 - Apple Watch 在用户主动开启实时模式后，通过 `HKWorkoutSession` 获取实时心率样本。
-- Cloudflare Worker 只保存每项指标的最新快照，并通过三个 MCP 工具返回数据与新鲜度。
+- 睡眠保存最近 7 天的阶段片段（在床、清醒、核心、深睡、REM 等），其余指标每项保存最近 3 次采样。
+- Cloudflare Worker 自动去重和裁剪历史，并通过四个 MCP 工具返回数据、新鲜度与保留范围。
 - 使用两个独立随机令牌保护上传接口和 MCP 地址。
 - 用户可以随时调用删除接口清空服务器上的健康快照。
 
@@ -18,17 +19,17 @@
 
 - MCP **不能远程启动 Apple Watch 传感器**。实时心率必须由用户在手表上打开 App 并点“开始”。
 - `watch_measure_now` 只能在实时模式已经运行时等待下一条新心率样本。
-- 血氧、噪音、睡眠等指标只能读取 HealthKit 中已有的最近记录，不能由第三方 App 强制立即测量。
+- 血氧、噪音、睡眠等指标只能读取 HealthKit 中已有的记录，不能由第三方 App 强制立即测量。
 - HealthKit 后台更新由系统调度，不保证零延迟。设备型号、地区、系统版本和用户授权会影响可用指标。
-- 本项目只保留最新快照，不保存历史趋势。
+- 保留窗口有意保持很短：睡眠 7 天，其他指标 3 次。本项目不是长期健康档案或医疗数据库。
 
 ## 架构
 
 ```mermaid
 flowchart LR
     W[Apple Watch App] -->|实时心率 HTTPS| C[Cloudflare Worker]
-    I[iPhone HealthKit App] -->|最新健康快照 HTTPS| C
-    C --> D[(Durable Object\n仅最新快照)]
+    I[iPhone HealthKit App] -->|受限健康历史 HTTPS| C
+    C --> D[(Durable Object\n睡眠 7 天 / 其他 3 次)]
     A[ChatGPT / MCP Client] -->|远程 MCP| C
 ```
 
@@ -107,7 +108,8 @@ https://watch-health-mcp.<your-subdomain>.workers.dev/mcp/<MCP_PATH_TOKEN>
 可用工具：
 
 - `watch_health_open_session`: 首先调用，查看连接、实时模式与数据新鲜度。
-- `watch_get_latest_health`: 读取所有最新指标、采样时间和数据年龄。
+- `watch_get_latest_health`: 读取所有最新指标、采样时间、数据年龄和历史条数。
+- `watch_get_health_history`: 读取睡眠近 7 天的完整阶段，或其他指标最近 3 次采样；可通过 `metric` 参数只查询一项。
 - `watch_measure_now`: 实时模式开启时，等待一条请求之后产生的新心率样本。
 
 ## 删除云端数据
@@ -118,7 +120,7 @@ curl -X DELETE \
   "https://watch-health-mcp.<your-subdomain>.workers.dev/data"
 ```
 
-返回 `{"ok":true,"deleted":true}` 后，Durable Object 中的最新快照与待处理命令已被清除。
+返回 `{"ok":true,"deleted":true}` 后，Durable Object 中的最新数据、受限历史与待处理命令已被清除。
 
 ## 开发检查
 

@@ -6,7 +6,10 @@ const JSON_HEADERS = {
 const MCP_PROTOCOL_VERSION = "2025-06-18";
 const LIVE_FRESH_SECONDS = 15;
 const RECENT_SECONDS = 5 * 60;
-const MAX_UPLOAD_BYTES = 64 * 1024;
+const MAX_UPLOAD_BYTES = 256 * 1024;
+const SLEEP_RETENTION_DAYS = 7;
+const DEFAULT_HISTORY_COUNT = 3;
+const MAX_SLEEP_RECORDS = 750;
 
 function json(value, status = 200) {
   return new Response(JSON.stringify(value), { status, headers: JSON_HEADERS });
@@ -47,6 +50,85 @@ function latestMetricDate(metrics = {}) {
     .map((metric) => Date.parse(metric?.sampled_at || ""))
     .filter(Number.isFinite);
   return timestamps.length ? new Date(Math.max(...timestamps)).toISOString() : null;
+}
+
+function recordTimestamp(record) {
+  const timestamp = Date.parse(record?.sampled_at || "");
+  return Number.isFinite(timestamp) ? timestamp : 0;
+}
+
+function recordSignature(record) {
+  return JSON.stringify([
+    record?.sampled_at || null,
+    record?.started_at || null,
+    record?.stage || null,
+    record?.source_device || null,
+    record?.value ?? null,
+    record?.unit || null,
+  ]);
+}
+
+function retentionFor(metric) {
+  return metric === "sleep"
+    ? { mode: "duration", days: SLEEP_RETENTION_DAYS, max_records: MAX_SLEEP_RECORDS }
+    : { mode: "count", count: DEFAULT_HISTORY_COUNT };
+}
+
+function pruneHistory(metric, records, now = Date.now()) {
+  const unique = new Map();
+  for (const record of records) {
+    if (record && typeof record === "object") unique.set(recordSignature(record), record);
+  }
+  const sorted = [...unique.values()].sort((a, b) => recordTimestamp(b) - recordTimestamp(a));
+
+  if (metric === "sleep") {
+    const cutoff = now - SLEEP_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    return sorted.filter((record) => recordTimestamp(record) >= cutoff).slice(0, MAX_SLEEP_RECORDS);
+  }
+  return sorted.slice(0, DEFAULT_HISTORY_COUNT);
+}
+
+function historiesForSnapshot(snapshot) {
+  const histories = {};
+  for (const [metric, records] of Object.entries(snapshot?.history || {})) {
+    histories[metric] = Array.isArray(records) ? records : [];
+  }
+  for (const [metric, record] of Object.entries(snapshot?.metrics || {})) {
+    histories[metric] = histories[metric]?.length ? histories[metric] : [record];
+  }
+  return histories;
+}
+
+function mergeHistories(previous, payload) {
+  const histories = historiesForSnapshot(previous);
+
+  for (const [metric, records] of Object.entries(payload?.history || {})) {
+    if (!Array.isArray(records)) continue;
+    histories[metric] = [...(histories[metric] || []), ...records];
+  }
+  for (const [metric, record] of Object.entries(payload?.metrics || {})) {
+    histories[metric] = [...(histories[metric] || []), record];
+  }
+
+  return Object.fromEntries(
+    Object.entries(histories)
+      .map(([metric, records]) => [metric, pruneHistory(metric, records)])
+      .filter(([, records]) => records.length)
+  );
+}
+
+function historySummary(histories) {
+  return Object.fromEntries(Object.entries(histories).map(([metric, records]) => [metric, {
+    count: records.length,
+    newest_sampled_at: records[0]?.sampled_at || null,
+    oldest_sampled_at: records.at(-1)?.sampled_at || null,
+    retention: retentionFor(metric),
+  }]));
+}
+
+function recordWithFreshness(record) {
+  const age = ageSeconds(record?.sampled_at);
+  return { ...record, age_seconds: age, freshness: freshnessForAge(age) };
 }
 
 function freshnessForAge(age) {
@@ -96,10 +178,31 @@ function toolsList() {
     },
     {
       name: "watch_get_latest_health",
-      description: "Read all latest health metrics uploaded by the iPhone or Apple Watch, including timestamps and age. This does not claim old data is a new measurement.",
+      description: "Read the latest value for every health metric plus history counts and retention policies. Use watch_get_health_history for sleep stages or recent samples.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       annotations: {
         title: "Read latest Apple Watch health data",
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    {
+      name: "watch_get_health_history",
+      description: "Read retained health history. Sleep includes all stage segments from the last 7 days; other metrics include their 3 most recent samples.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          metric: {
+            type: "string",
+            description: "Optional metric key such as sleep, heart_rate, oxygen_saturation, or environmental_audio_exposure. Omit to return all retained history.",
+          },
+        },
+        additionalProperties: false,
+      },
+      annotations: {
+        title: "Read retained Apple Watch health history",
         readOnlyHint: true,
         destructiveHint: false,
         idempotentHint: true,
@@ -122,16 +225,8 @@ function snapshotEnvelope(snapshot) {
   const age = ageSeconds(snapshot.sampled_at || snapshot.uploaded_at);
   const liveMode = snapshot.live_mode === true && age !== null && age <= RECENT_SECONDS;
   const freshness = freshnessForAge(age);
-  const metrics = Object.fromEntries(
-    Object.entries(snapshot.metrics || {}).map(([key, metric]) => {
-      const metricAge = ageSeconds(metric?.sampled_at);
-      return [key, {
-        ...metric,
-        age_seconds: metricAge,
-        freshness: freshnessForAge(metricAge),
-      }];
-    })
-  );
+  const histories = historiesForSnapshot(snapshot);
+  const metrics = Object.fromEntries(Object.entries(snapshot.metrics || {}).map(([key, metric]) => [key, recordWithFreshness(metric)]));
 
   return {
     ...snapshot,
@@ -140,6 +235,34 @@ function snapshotEnvelope(snapshot) {
     freshness,
     age_seconds: age,
     metrics,
+    history_summary: historySummary(histories),
+    retention_policy: {
+      sleep: retentionFor("sleep"),
+      all_other_metrics: retentionFor("heart_rate"),
+    },
+  };
+}
+
+function historyEnvelope(snapshot, requestedMetric) {
+  if (!snapshot) return { connected: false, message: "No Apple Watch health data has been uploaded yet." };
+
+  const histories = historiesForSnapshot(snapshot);
+  const selected = requestedMetric
+    ? { [requestedMetric]: histories[requestedMetric] || [] }
+    : histories;
+  const history = Object.fromEntries(
+    Object.entries(selected).map(([metric, records]) => [metric, records.map(recordWithFreshness)])
+  );
+
+  return {
+    generated_at: isoNow(),
+    requested_metric: requestedMetric || null,
+    retention_policy: {
+      sleep: retentionFor("sleep"),
+      all_other_metrics: retentionFor("heart_rate"),
+    },
+    history,
+    history_summary: historySummary(selected),
   };
 }
 
@@ -148,6 +271,12 @@ async function callTool(env, name, args) {
     const response = await relay(env).fetch("https://relay/snapshot");
     const snapshot = response.status === 404 ? null : await response.json();
     return toolText(snapshotEnvelope(snapshot));
+  }
+
+  if (name === "watch_get_health_history") {
+    const response = await relay(env).fetch("https://relay/snapshot");
+    const snapshot = response.status === 404 ? null : await response.json();
+    return toolText(historyEnvelope(snapshot, typeof args?.metric === "string" ? args.metric : null));
   }
 
   if (name === "watch_measure_now") {
@@ -202,8 +331,8 @@ async function handleMcp(request, env, pathToken) {
       return rpcResult(rpc.id, {
         protocolVersion: MCP_PROTOCOL_VERSION,
         capabilities: { tools: {} },
-        serverInfo: { name: "apple-watch-health", version: "0.1.0" },
-        instructions: "Call watch_health_open_session first. Treat freshness=live as real-time. Always disclose age_seconds for recent or stale readings. watch_measure_now can obtain a new sample only while the user's visible Apple Watch live mode is active.",
+        serverInfo: { name: "apple-watch-health", version: "0.2.0" },
+        instructions: "Call watch_health_open_session first. Treat freshness=live as real-time and disclose age_seconds for older readings. Use watch_get_health_history for sleep analysis and trends: sleep retains all stage segments for 7 days, while every other metric retains its 3 newest samples. watch_measure_now can obtain a new sample only while the user's visible Apple Watch live mode is active.",
       });
     }
     if (rpc.method === "notifications/initialized") return new Response(null, { status: 202 });
@@ -233,14 +362,15 @@ export class HealthRelay {
     if (url.pathname === "/upload" && request.method === "POST") {
       const payload = await request.json();
       const previous = await this.state.storage.get("latest_snapshot");
-      const metrics = {
-        ...(previous?.metrics || {}),
-        ...(payload.metrics || {}),
-      };
+      const history = mergeHistories(previous, payload);
+      const metrics = Object.fromEntries(
+        Object.entries(history).filter(([, records]) => records.length).map(([metric, records]) => [metric, records[0]])
+      );
       const snapshot = {
         ...(previous || {}),
         ...payload,
         metrics,
+        history,
         sampled_at: latestMetricDate(metrics) || payload.sampled_at || previous?.sampled_at || isoNow(),
         uploaded_at: isoNow(),
       };
