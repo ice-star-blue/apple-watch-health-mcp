@@ -37,8 +37,18 @@ flowchart LR
 
 - `ios/`: SwiftUI iPhone App、watchOS App 和 Xcode 工程。
 - `cloudflare/`: Worker、Durable Object、MCP 接口和自动测试。
+- `self-hosted/`: Python alternative backend — no Cloudflare Workers Paid, no Xcode. Uses Health Auto Export app instead of custom iOS app.
 - `PRIVACY.md`: 数据流、风险和删除方式。
 - `SECURITY.md`: 密钥管理与漏洞报告建议。
+
+## Two deployment options
+
+| | Cloudflare Worker | Self-Hosted Python |
+|--|---|---|
+| Cost | $5/month (Workers Paid) | $0 |
+| iOS app | Custom Swift (Xcode + $99/yr Apple Developer) | Health Auto Export ($3-40, one-time) |
+| Real-time heart rate | Yes | No (periodic snapshots) |
+| See | [`cloudflare/`](cloudflare/) | [`self-hosted/`](self-hosted/) |
 
 ## 1. 部署 Cloudflare Worker
 
