@@ -34,7 +34,7 @@ RECENT_SECONDS = 5 * 60
 SLEEP_RETENTION_DAYS = 7
 DEFAULT_HISTORY_COUNT = 3
 MAX_SLEEP_RECORDS = 750
-MAX_UPLOAD_BYTES = 256 * 1024
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MCP_PROTOCOL_VERSION = "2025-06-18"
 
 # ============================================================
@@ -181,36 +181,87 @@ def is_hae_payload(body):
     return isinstance(body, dict) and "data" in body and "metrics" in body.get("data", {}) and isinstance(body["data"]["metrics"], list)
 
 def transform_hae(body):
-    """Transform HAE payload to (metrics_dict, sleep_list)"""
+    """Transform HAE payload to (metrics_dict, sleep_list).
+
+    Handles both formats:
+    - Flat: [{name, qty, unit, date}] (older/test format)
+    - Nested v2: [{name, units, data: [{date, qty, source}]}] (real HAE export)
+    """
     metrics = {}
     sleep_segments = []
-    
+
     for m in body["data"]["metrics"]:
-        if not m or "name" not in m or m.get("qty") is None:
+        if not m or "name" not in m:
             continue
-        
+
         mapped_key = HAE_METRIC_MAP.get(m["name"], m["name"])
-        sampled_at = parse_hae_date(m.get("date")) or iso_now()
-        
-        if mapped_key == "sleep":
-            stage = SLEEP_STAGE_MAP.get(m.get("sleepStage"), SLEEP_STAGE_MAP.get(str(m.get("sleepStage")), "unknown"))
-            sleep_segments.append({
-                "stage": stage,
-                "value": m["qty"],
-                "unit": m.get("unit", "hr"),
-                "started_at": sampled_at,
-                "sampled_at": sampled_at,
-            })
-        elif mapped_key == "blood_pressure" and "systolic" in m:
-            metrics["blood_pressure_systolic"] = {"value": m["systolic"], "unit": "mmHg", "sampled_at": sampled_at}
-            metrics["blood_pressure_diastolic"] = {"value": m["diastolic"], "unit": "mmHg", "sampled_at": sampled_at}
-        else:
-            metrics[mapped_key] = {
-                "value": m["qty"],
-                "unit": m.get("unit", ""),
-                "sampled_at": sampled_at,
-            }
-    
+        unit = m.get("units") or m.get("unit") or ""
+
+        # Nested v2 format: metric has a "data" array of samples
+        if "data" in m and isinstance(m["data"], list):
+            samples = m["data"]
+            if not samples:
+                continue
+
+            if mapped_key == "sleep":
+                # Store all sleep segments
+                for s in samples:
+                    if s.get("qty") is None:
+                        continue
+                    sampled_at = parse_hae_date(s.get("date")) or iso_now()
+                    stage = SLEEP_STAGE_MAP.get(s.get("sleepStage"), SLEEP_STAGE_MAP.get(str(s.get("sleepStage")), "unknown"))
+                    sleep_segments.append({
+                        "stage": stage,
+                        "value": s["qty"],
+                        "unit": unit or "hr",
+                        "started_at": sampled_at,
+                        "sampled_at": sampled_at,
+                    })
+            elif mapped_key == "blood_pressure":
+                # Take most recent sample
+                latest = max(samples, key=lambda s: s.get("date", ""))
+                if latest.get("qty") is not None:
+                    sampled_at = parse_hae_date(latest.get("date")) or iso_now()
+                    bp_val = str(latest["qty"])
+                    if "/" in bp_val:
+                        sys_val, dia_val = bp_val.split("/", 1)
+                        metrics["blood_pressure_systolic"] = {"value": float(sys_val), "unit": "mmHg", "sampled_at": sampled_at}
+                        metrics["blood_pressure_diastolic"] = {"value": float(dia_val), "unit": "mmHg", "sampled_at": sampled_at}
+            else:
+                # Take most recent sample for this metric
+                latest = max(samples, key=lambda s: s.get("date", ""))
+                if latest.get("qty") is None:
+                    continue
+                sampled_at = parse_hae_date(latest.get("date")) or iso_now()
+                metrics[mapped_key] = {
+                    "value": latest["qty"],
+                    "unit": unit,
+                    "sampled_at": sampled_at,
+                }
+
+        # Flat format (qty directly on metric)
+        elif m.get("qty") is not None:
+            sampled_at = parse_hae_date(m.get("date")) or iso_now()
+
+            if mapped_key == "sleep":
+                stage = SLEEP_STAGE_MAP.get(m.get("sleepStage"), SLEEP_STAGE_MAP.get(str(m.get("sleepStage")), "unknown"))
+                sleep_segments.append({
+                    "stage": stage,
+                    "value": m["qty"],
+                    "unit": unit or "hr",
+                    "started_at": sampled_at,
+                    "sampled_at": sampled_at,
+                })
+            elif mapped_key == "blood_pressure" and "systolic" in m:
+                metrics["blood_pressure_systolic"] = {"value": m["systolic"], "unit": "mmHg", "sampled_at": sampled_at}
+                metrics["blood_pressure_diastolic"] = {"value": m["diastolic"], "unit": "mmHg", "sampled_at": sampled_at}
+            else:
+                metrics[mapped_key] = {
+                    "value": m["qty"],
+                    "unit": unit,
+                    "sampled_at": sampled_at,
+                }
+
     return metrics, sleep_segments
 
 def store_metrics(metrics, sleep_segments):
@@ -405,8 +456,9 @@ def handle_mcp_call(name, args):
 
 class HealthMCPHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Minimal logging
-        pass
+        import sys, os
+        if os.environ.get("HEALTH_DEBUG"):
+            sys.stderr.write("[%s] %s\n" % (iso_now(), format % args))
     
     def _send_json(self, data, status=200):
         body = json.dumps(data).encode()
@@ -420,8 +472,12 @@ class HealthMCPHandler(BaseHTTPRequestHandler):
     def _bearer_ok(self, expected):
         if not expected:
             return True
+        # Accept either Authorization: Bearer <token> or X-API-KEY: <token>
         auth = self.headers.get("Authorization", "")
-        return auth == f"Bearer {expected}"
+        if auth == f"Bearer {expected}":
+            return True
+        api_key = self.headers.get("X-API-KEY", "")
+        return api_key == expected
     
     def do_GET(self):
         path = urlparse(self.path).path
@@ -449,6 +505,7 @@ class HealthMCPHandler(BaseHTTPRequestHandler):
             return
         
         raw_body = self.rfile.read(content_length) if content_length else b""
+
         
         try:
             body = json.loads(raw_body) if raw_body else {}
@@ -456,8 +513,8 @@ class HealthMCPHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "invalid JSON"}, 400)
             return
         
-        # === HAE Upload Endpoint ===
-        if path == "/upload":
+        # === HAE Upload Endpoint (also accepts /api/health-export) ===
+        if path in ("/upload", "/api/health-export"):
             if not self._bearer_ok(UPLOAD_TOKEN):
                 self._send_json({"error": "unauthorized"}, 401)
                 return

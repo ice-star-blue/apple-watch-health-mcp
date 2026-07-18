@@ -37,8 +37,9 @@ Environment variables (all optional, see defaults in script):
 |----------|---------|-------------|
 | `HEALTH_PORT` | `8787` | Port to listen on |
 | `HEALTH_DB_PATH` | `~/.local/share/health-mcp/health.db` | SQLite database path |
-| `HEALTH_UPLOAD_TOKEN` | (empty = open) | Bearer token for `/upload` endpoint |
+| `HEALTH_UPLOAD_TOKEN` | (empty = open) | Bearer token for `/upload` endpoint (also accepts `X-API-KEY` header) |
 | `HEALTH_MCP_TOKEN` | (empty = `/mcp` only) | Token for remote MCP at `/mcp/<token>` |
+| `HEALTH_DEBUG` | (unset) | Set to `1` to enable verbose request logging |
 
 Generate tokens:
 
@@ -52,8 +53,8 @@ python3 health-mcp-server.py
 
 In the HAE iOS app, create a **REST API Automation**:
 
-1. **URL**: `https://<your-domain>/upload`
-2. **HTTP Headers**: `Authorization: Bearer <UPLOAD_TOKEN>`
+1. **URL**: `https://<your-domain>/upload` (also accepts `/api/health-export`)
+2. **HTTP Headers**: `Authorization: Bearer ***` or `X-API-KEY: ***`
 3. **Export Format**: JSON
 4. **Data Type**: Health Metrics
 5. Enable **Batch Requests** for large exports
